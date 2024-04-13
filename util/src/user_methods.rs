@@ -6,6 +6,8 @@ use piccolo::{
     MetaMethod, Table, UserData, Value,
 };
 
+use crate::callback_fn;
+
 pub struct UserMethods<'gc, U: for<'a> Rootable<'a>> {
     table: Table<'gc>,
     _marker: PhantomData<U>,
@@ -34,13 +36,9 @@ impl<'gc, U: for<'a> Rootable<'a>> UserMethods<'gc, U> {
         A: FromMultiValue<'gc>,
         R: IntoMultiValue<'gc>,
     {
-        let callback = Callback::from_fn(&ctx, move |ctx, exec, mut stack| {
-            let userdata: UserData = stack.from_front(ctx)?;
-            let args: A = stack.consume(ctx)?;
-            let this = userdata.downcast::<U>()?;
-            let ret = method(&this, ctx, exec, args)?;
-            stack.replace(ctx, ret);
-            Ok(CallbackReturn::Return)
+        let callback = callback_fn(&ctx, move |ctx, exec, (this, args): (UserData, A)| {
+            let this = this.downcast::<U>()?;
+            method(&this, ctx, exec, args)
         });
 
         !self.table.set(ctx, name, callback).unwrap().is_nil()
@@ -58,13 +56,9 @@ impl<'gc, U: for<'a> Rootable<'a>> UserMethods<'gc, U> {
         A: FromMultiValue<'gc>,
         R: IntoMultiValue<'gc>,
     {
-        let callback = Callback::from_fn(&ctx, move |ctx, exec, mut stack| {
-            let userdata: UserData = stack.from_front(ctx)?;
-            let args: A = stack.consume(ctx)?;
-            let mut this = userdata.downcast_write::<U>(&ctx)?;
-            let ret = method(&mut this, ctx, exec, args)?;
-            stack.replace(ctx, ret);
-            Ok(CallbackReturn::Return)
+        let callback = callback_fn(&ctx, move |ctx, exec, (this, args): (UserData, A)| {
+            let this = this.downcast_write::<U>(&ctx)?;
+            method(&this, ctx, exec, args)
         });
 
         !self.table.set(ctx, name, callback).unwrap().is_nil()
@@ -116,13 +110,9 @@ impl<'gc, U: 'static> StaticUserMethods<'gc, U> {
         A: FromMultiValue<'gc>,
         R: IntoMultiValue<'gc>,
     {
-        let callback = Callback::from_fn(&ctx, move |ctx, exec, mut stack| {
-            let userdata: UserData = stack.from_front(ctx)?;
-            let args: A = stack.consume(ctx)?;
-            let this = userdata.downcast_static::<U>()?;
-            let ret = method(&this, ctx, exec, args)?;
-            stack.replace(ctx, ret);
-            Ok(CallbackReturn::Return)
+        let callback = callback_fn(&ctx, move |ctx, exec, (this, args): (UserData, A)| {
+            let this = this.downcast_static::<U>()?;
+            method(&this, ctx, exec, args)
         });
 
         !self.table.set(ctx, name, callback).unwrap().is_nil()
