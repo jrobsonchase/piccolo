@@ -45,6 +45,7 @@ gc-arena.workspace = true
 hashbrown.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+tracing = "0.1.40"
 
 [dev-dependencies]
 clap = { version = "4.4", features = ["cargo"] }

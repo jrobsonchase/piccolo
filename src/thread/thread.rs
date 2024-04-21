@@ -2,6 +2,7 @@ use std::{
     cell::RefMut,
     hash::{Hash, Hasher},
 };
+use tracing::*;
 
 use allocator_api2::vec;
 use gc_arena::{allocator_api::MetricsAlloc, lock::RefLock, Collect, Gc, GcWeak, Mutation};
@@ -169,6 +170,7 @@ impl<'gc> Thread<'gc> {
     pub fn reset(self, mc: &Mutation<'gc>) -> Result<(), BadThreadMode> {
         match self.0.try_borrow_mut(mc) {
             Ok(mut state) => {
+                debug!("resetting state");
                 state.reset(mc);
                 Ok(())
             }
@@ -463,6 +465,7 @@ impl<'gc> ThreadState<'gc> {
     fn reset(&mut self, mc: &Mutation<'gc>) {
         self.close_upvalues(mc, 0);
         assert!(self.open_upvalues.is_empty());
+        debug!("clearing stack");
         self.stack.clear();
         self.frames.clear();
     }
