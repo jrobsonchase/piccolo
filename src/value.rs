@@ -2,7 +2,10 @@ use std::{f64, fmt, i64, io, string::String as StdString};
 
 use gc_arena::{Collect, Gc};
 
-use crate::{Callback, Closure, Constant, Function, String, Table, Thread, UserData};
+use crate::{
+    Callback, Closure, Constant, Context, FromValue, Function, String, Table, Thread, TypeError,
+    UserData,
+};
 
 #[derive(Debug, Copy, Clone, Collect)]
 #[collect(no_drop)]
@@ -93,6 +96,10 @@ impl<'gc> Value<'gc> {
             Value::String(s) => Some(Constant::String(s)),
             _ => None,
         }
+    }
+
+    pub fn to_native<T: FromValue<'gc>>(self, ctx: Context<'gc>) -> Result<T, TypeError> {
+        T::from_value(ctx, self)
     }
 }
 
