@@ -125,6 +125,37 @@ impl<'gc> Table<'gc> {
     ) -> Option<Table<'gc>> {
         mem::replace(&mut self.0.borrow_mut(mc).metatable, metatable)
     }
+
+    pub fn from_iter<V>(
+        ctx: Context<'gc>,
+        iter: impl IntoIterator<Item = V>,
+    ) -> Result<Self, InvalidTableKey>
+    where
+        V: IntoValue<'gc>,
+    {
+        Self::from_pairs(
+            ctx,
+            iter.into_iter().enumerate().map(|(i, v)| {
+                let i = i + 1;
+                (i as u32, v)
+            }),
+        )
+    }
+
+    pub fn from_pairs<K, V>(
+        ctx: Context<'gc>,
+        iter: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self, InvalidTableKey>
+    where
+        K: IntoValue<'gc>,
+        V: IntoValue<'gc>,
+    {
+        let this = Table::new(&ctx);
+        for (k, v) in iter.into_iter() {
+            this.set(ctx, k, v)?;
+        }
+        Ok(this)
+    }
 }
 
 #[derive(Copy, Clone, Collect)]
