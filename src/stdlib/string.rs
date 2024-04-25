@@ -1,4 +1,6 @@
-use crate::{Callback, CallbackReturn, Context, IntoValue, Table, Value};
+use anyhow::bail;
+
+use crate::{Callback, CallbackReturn, Context, FromValue, IntoValue, Table, Value};
 
 pub fn load_string<'gc>(ctx: Context<'gc>) {
     let string = Table::new(&ctx);
@@ -20,6 +22,50 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
                 } else {
                     Err("Bad argument to len".into_value(ctx).into())
                 }
+            }),
+        )
+        .unwrap();
+
+    string
+        .set(
+            ctx,
+            "byte",
+            Callback::from_fn(&ctx, |ctx, _, mut stack| {
+                let (s, i, j): (crate::String, u32, Option<u32>) = stack.consume(ctx)?;
+
+                let j = j.unwrap_or(i);
+
+                let bytes = s.as_bytes();
+                for i in i..=j {
+                    if i == 0 {
+                        continue;
+                    }
+                    if let Some(b) = bytes.get(i as usize - 1) {
+                        stack.push_back(b.into_value(ctx));
+                    }
+                }
+                Ok(CallbackReturn::Return)
+            }),
+        )
+        .unwrap();
+
+    string
+        .set(
+            ctx,
+            "char",
+            Callback::from_fn(&ctx, |ctx, _, mut stack| {
+                let mut buf = vec![];
+                loop {
+                    if stack.is_empty() {
+                        break;
+                    }
+                    let code = <u8>::from_value(ctx, stack.pop_front())?;
+                    buf.push(code);
+                }
+
+                stack.push_back(crate::String::from_buffer(&ctx, buf.into()).into_value(ctx));
+
+                Ok(CallbackReturn::Return)
             }),
         )
         .unwrap();
