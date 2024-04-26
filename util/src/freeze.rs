@@ -1,5 +1,9 @@
+use std::fmt::Debug;
+use std::ops::Deref;
+use std::sync::Arc;
 use std::{cell::RefCell, marker::PhantomData, mem, rc::Rc};
 
+use parking_lot::RwLock;
 use thiserror::Error;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Error)]
@@ -10,6 +14,86 @@ pub enum AccessError {
     BadBorrow,
 }
 
+/// Trait for accessing shared data, mutably or otherwise.
+pub trait Access<T> {
+    /// Attempt to access the wrapped value immutably.
+    /// Should return `None` if it is already being accessed mutably.
+    fn try_with<F: FnOnce(&T) -> R, R>(&self, f: F) -> Option<R>;
+    /// Attempt to access the wrapped value mutably.
+    /// Should return `None` if it is already being accessed mutably or
+    /// immutably.
+    fn try_with_mut<F: FnOnce(&mut T) -> R, R>(&self, f: F) -> Option<R>;
+
+    /// Convenience method for calling `.try_with(f).unwrap()`
+    fn with<F: FnOnce(&T) -> R, R>(&self, f: F) -> R {
+        self.try_with(f).unwrap()
+    }
+    /// Convenience method for calling `.try_with_mut(f).unwrap()`
+    fn with_mut<F: FnOnce(&mut T) -> R, R>(&self, f: F) -> R {
+        self.try_with_mut(f).unwrap()
+    }
+}
+
+impl<T> Access<T> for RefCell<T> {
+    fn try_with<F: FnOnce(&T) -> R, R>(&self, f: F) -> Option<R> {
+        self.try_borrow().ok().as_deref().map(f)
+    }
+    fn try_with_mut<F: FnOnce(&mut T) -> R, R>(&self, f: F) -> Option<R> {
+        self.try_borrow_mut().ok().as_deref_mut().map(f)
+    }
+}
+
+impl<T> Access<T> for RwLock<T> {
+    fn try_with<F: FnOnce(&T) -> R, R>(&self, f: F) -> Option<R> {
+        Some(f(&*self.read()))
+    }
+    fn try_with_mut<F: FnOnce(&mut T) -> R, R>(&self, f: F) -> Option<R> {
+        Some(f(&mut *self.write()))
+    }
+}
+
+/// Trait for producing clonable "handles" to data with interior mutability.
+pub trait Handle {
+    type Ptr<T>: Deref<Target = Self::Access<T>>;
+    type Access<T>: Access<T>;
+
+    fn clone<T>(ptr: &Self::Ptr<T>) -> Self::Ptr<T>;
+    fn new<T>(val: T) -> Self::Ptr<T>;
+}
+
+/// Handle implementation for local-only data.
+/// `!Send + !Sync`, but lower overhead than `SendHandle`.
+pub struct LocalHandle;
+
+impl Handle for LocalHandle {
+    type Ptr<T> = Rc<RefCell<T>>;
+    type Access<T> = RefCell<T>;
+
+    fn clone<T>(ptr: &Self::Ptr<T>) -> Self::Ptr<T> {
+        Rc::clone(ptr)
+    }
+
+    fn new<T>(val: T) -> Self::Ptr<T> {
+        Rc::new(RefCell::new(val))
+    }
+}
+
+/// Handle implementation for data that needs to be `Send + Sync`.
+pub struct SendHandle;
+
+impl Handle for SendHandle {
+    type Ptr<T> = Arc<RwLock<T>>;
+    type Access<T> = RwLock<T>;
+
+    fn clone<T>(ptr: &Self::Ptr<T>) -> Self::Ptr<T> {
+        Arc::clone(ptr)
+    }
+
+    fn new<T>(val: T) -> Self::Ptr<T> {
+        Arc::new(RwLock::new(val))
+    }
+}
+
 /// Safely erase a lifetime from a value and temporarily store it in a shared handle.
 ///
 /// Works by providing only limited access to the held value within an enclosing call to
@@ -18,8 +102,8 @@ pub enum AccessError {
 ///
 /// Useful for passing non-'static values into things that do not understand the Rust lifetime
 /// system and need unrestricted sharing, such as scripting languages.
-pub struct Frozen<F: for<'f> Freeze<'f>> {
-    inner: Rc<RefCell<Option<<F as Freeze<'static>>::Frozen>>>,
+pub struct Frozen<F: for<'f> Freeze<'f>, M: Handle = LocalHandle> {
+    inner: M::Ptr<Option<<F as Freeze<'static>>::Frozen>>,
 }
 
 pub trait Freeze<'f>: 'static {
@@ -47,29 +131,29 @@ macro_rules! __scripting_Freeze {
 
 pub use crate::__scripting_Freeze as Freeze;
 
-impl<F: for<'a> Freeze<'a>> Clone for Frozen<F> {
+impl<F: for<'a> Freeze<'a>, M: Handle> Clone for Frozen<F, M> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            inner: M::clone(&self.inner),
         }
     }
 }
 
-impl<F: for<'a> Freeze<'a>> Default for Frozen<F> {
+impl<F: for<'a> Freeze<'a>, M: Handle> Default for Frozen<F, M> {
     fn default() -> Self {
         Self {
-            inner: Rc::new(RefCell::new(None)),
+            inner: M::new(None),
         }
     }
 }
 
-impl<F: for<'a> Freeze<'a>> Frozen<F> {
+impl<F: for<'a> Freeze<'a>, M: Handle> Frozen<F, M> {
     /// Creates a new *invalid* `Frozen` handle.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn in_scope<'f, R>(value: <F as Freeze<'f>>::Frozen, cb: impl FnOnce(Self) -> R) -> R {
+    pub fn in_scope<R>(value: <F as Freeze<'_>>::Frozen, cb: impl FnOnce(Self) -> R) -> R {
         let f = Self::new();
         let p = f.clone();
         FrozenScope::new().freeze(&f, value).scope(move || cb(p))
@@ -77,8 +161,8 @@ impl<F: for<'a> Freeze<'a>> Frozen<F> {
 
     /// Returns true if this value is currently set by an enclosing `FrozenScope::scope`.
     pub fn is_valid(&self) -> bool {
-        if let Ok(b) = self.inner.try_borrow() {
-            b.is_some()
+        if let Some(b) = self.inner.try_with(|inner| inner.is_some()) {
+            b
         } else {
             true
         }
@@ -88,12 +172,12 @@ impl<F: for<'a> Freeze<'a>> Frozen<F> {
         &self,
         f: impl for<'f> FnOnce(&<F as Freeze<'f>>::Frozen) -> R,
     ) -> Result<R, AccessError> {
-        Ok(f(self
-            .inner
-            .try_borrow()
-            .map_err(|_| AccessError::BadBorrow)?
-            .as_ref()
-            .ok_or(AccessError::Expired)?))
+        let res = self.inner.try_with(|inner| inner.as_ref().map(f));
+        match res {
+            None => Err(AccessError::BadBorrow),
+            Some(None) => Err(AccessError::Expired),
+            Some(Some(v)) => Ok(v),
+        }
     }
 
     /// # Panics
@@ -107,12 +191,12 @@ impl<F: for<'a> Freeze<'a>> Frozen<F> {
         &self,
         f: impl for<'f> FnOnce(&mut <F as Freeze<'f>>::Frozen) -> R,
     ) -> Result<R, AccessError> {
-        Ok(f(self
-            .inner
-            .try_borrow_mut()
-            .map_err(|_| AccessError::BadBorrow)?
-            .as_mut()
-            .ok_or(AccessError::Expired)?))
+        let res = self.inner.try_with_mut(|inner| inner.as_mut().map(f));
+        match res {
+            None => Err(AccessError::BadBorrow),
+            Some(None) => Err(AccessError::Expired),
+            Some(Some(v)) => Ok(v),
+        }
     }
 
     /// # Panics
@@ -140,11 +224,11 @@ impl FrozenScope<()> {
 
 impl<D: DropGuard> FrozenScope<D> {
     /// Sets the given frozen value for the duration of the `FrozenScope::scope` call.
-    pub fn freeze<'h, 'f, F: for<'a> Freeze<'a>>(
+    pub fn freeze<'h, 'f, F: for<'a> Freeze<'a>, M: Handle>(
         self,
-        handle: &'h Frozen<F>,
+        handle: &'h Frozen<F, M>,
         value: <F as Freeze<'f>>::Frozen,
-    ) -> FrozenScope<(FreezeGuard<'h, 'f, F>, D)> {
+    ) -> FrozenScope<(FreezeGuard<'h, 'f, F, M>, D)> {
         FrozenScope((
             FreezeGuard {
                 value: Some(value),
@@ -209,16 +293,21 @@ impl<A: DropGuard, B: DropGuard> DropGuard for (A, B) {
     }
 }
 
-pub struct FreezeGuard<'h, 'f, F: for<'a> Freeze<'a>> {
+pub struct FreezeGuard<'h, 'f, F: for<'a> Freeze<'a>, M: Handle = LocalHandle> {
     value: Option<<F as Freeze<'f>>::Frozen>,
-    handle: &'h Frozen<F>,
+    handle: &'h Frozen<F, M>,
 }
 
-impl<'h, 'f, F: for<'a> Freeze<'a>> Drop for FreezeGuard<'h, 'f, F> {
+impl<'h, 'f, F: for<'a> Freeze<'a>, M: Handle> Drop for FreezeGuard<'h, 'f, F, M> {
     fn drop(&mut self) {
-        if let Ok(mut v) = self.handle.inner.try_borrow_mut() {
-            *v = None;
-        } else {
+        if self
+            .handle
+            .inner
+            .try_with_mut(|inner| {
+                *inner = None;
+            })
+            .is_none()
+        {
             // This should not be possible to trigger safely, because users cannot hold
             // `Ref` or `RefMut` handles from the inner `RefCell` in the first place,
             // and `Frozen` does not implement Send so we can't be in the body of
@@ -231,22 +320,38 @@ impl<'h, 'f, F: for<'a> Freeze<'a>> Drop for FreezeGuard<'h, 'f, F> {
     }
 }
 
-impl<'h, 'f, F: for<'a> Freeze<'a>> DropGuard for FreezeGuard<'h, 'f, F> {
+impl<'h, 'f, F: for<'a> Freeze<'a>, M: Handle> DropGuard for FreezeGuard<'h, 'f, F, M> {
     unsafe fn set(&mut self) {
         assert!(
             !self.handle.is_valid(),
             "handle already used in another `FrozenScope::scope` call"
         );
-        *self.handle.inner.borrow_mut() = Some(mem::transmute::<
-            <F as Freeze<'f>>::Frozen,
-            <F as Freeze<'static>>::Frozen,
-        >(self.value.take().unwrap()));
+        self.handle.inner.with_mut(|inner| {
+            *inner = Some(mem::transmute::<
+                <F as Freeze<'f>>::Frozen,
+                <F as Freeze<'static>>::Frozen,
+            >(self.value.take().unwrap()))
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::mpsc::{channel, Sender},
+        thread,
+    };
+
     use super::*;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[allow(dead_code)]
+    fn asserts() {
+        assert_send::<Frozen<Freeze![&'freeze ()], SendHandle>>();
+        assert_sync::<Frozen<Freeze![&'freeze ()], SendHandle>>();
+    }
 
     #[test]
     fn test_freeze_works() {
@@ -257,6 +362,25 @@ mod tests {
             f.with(|f| {
                 assert_eq!(*f.0, 4);
             });
+        });
+    }
+
+    #[test]
+    fn test_multithread_freeze_works() {
+        struct F<'a>(&'a i32);
+        type FrozenF = Frozen<Freeze![F<'freeze>], SendHandle>;
+        let i = 4;
+
+        let (tx, rx) = channel::<(Sender<i32>, FrozenF)>();
+        thread::spawn(move || {
+            let (tx, msg) = rx.recv().unwrap();
+            tx.send(msg.with(|v| v.0 + 1)).unwrap();
+        });
+
+        Frozen::<Freeze![F<'freeze>], SendHandle>::in_scope(F(&i), |f| {
+            let (resp_tx, resp_rx) = channel::<i32>();
+            tx.send((resp_tx, f)).unwrap();
+            assert_eq!(resp_rx.recv().unwrap(), 5);
         });
     }
 

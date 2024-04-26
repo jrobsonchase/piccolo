@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use allocator_api2::vec;
 use gc_arena::{allocator_api::MetricsAlloc, lock::RefLock, Collect, Gc, Mutation};
 use thiserror::Error;
+use tracing::*;
 
 use crate::{
     compiler::{FunctionRef, LineNumber},
@@ -522,6 +523,7 @@ impl<'gc> Executor<'gc> {
         function: Function<'gc>,
         args: impl IntoMultiValue<'gc>,
     ) {
+        debug!("restarting executor");
         let mut state = self.0.borrow_mut(&ctx);
         state.thread_stack.truncate(1);
         state.thread_stack[0].reset(&ctx).unwrap();
